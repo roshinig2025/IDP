@@ -1,5 +1,16 @@
-"""Scripted GUI smoke test — drives BioCryptApp through the full demo flow
-with a scripted BLE link (no randomness) and an in-memory audit DB.
+"""Scripted GUI smoke test — drives BioCryptApp through the full policy-v2
+demo flow with a scripted BLE link (no randomness) and a fresh audit DB.
+
+Covers:
+  [1] perfect match (fp=100, RSSI >= -50)  -> instant unlock, NO OTP
+  [2] perfect match STILL unlocks with failed attempts on record
+  [3] Low tier: 4-digit OTP, wrong x3 -> HARD LOCK (no auto recovery)
+  [4] Reset lock button recovers
+  [5] Medium tier: 6-digit OTP, wrong x2 + correct on 3rd try -> unlock
+  [6] replay of a used code is rejected AND consumes a try
+  [7] High tier: 8-digit OTP, single try -> wrong entry -> HARD LOCK
+  [8] vault auto-decrypts after a successful auth
+  [9] audit chain intact, replay + reset events persisted
 
 Run:  python tests/gui_smoke.py
 Pass: prints SMOKE PASSED and exit code 0.
@@ -11,7 +22,6 @@ import os
 import sys
 import tempfile
 import time
-import types
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -21,8 +31,7 @@ import tkinter as tk
 
 from biocrypt.audit.logger import AuditLogger
 from biocrypt.crypto import vault
-from biocrypt.engine import totp
-from biocrypt.ui.app import DEMO_PASSPHRASE, SCENARIOS, BioCryptApp
+from biocrypt.ui.app import DEMO_PASSPHRASE, BioCryptApp
 from biocrypt.ui.ble_link import BlePacket
 
 
@@ -76,106 +85,165 @@ def main() -> int:
     root.deiconify()
     pump(root, 400)
 
-    # -- 1. Trusted-user scenario: direct unlock --------------------------
-    print("\n[1] Trusted User scenario")
-    app._apply_scenario("Trusted User")
+    # -- 1. Perfect match: instant unlock, no OTP --------------------------
+    print("\\n[1] Trusted User scenario (perfect match)")
+    app._apply_scenario("Trusted User")     # fp=100, rssi=-45, fails=0
     pump(root, 300)
-    risk = app._pending_risk if hasattr(app, "_pending_risk") else None
     check("no OTP issued", len(app.link.sent) == 0)
     check("status says Unlocked",
           "Unlocked" in app.result_lbl.cget("text"))
+    check("tier label shows PERFECT MATCH",
+          "PERFECT" in app.tier_lbl.cget("text"))
 
-    # -- 2. Moderate scenario: 6-digit OTP via trusted device -------------
-    print("\n[2] Moderate Risk scenario (OTP step-up)")
-    app._apply_scenario("Moderate Risk")
+    # -- 2. Perfect match overrides failed attempts -------------------------
+    print("\\n[2] Perfect match with failed attempts on record")
+    app.fp_var.set(100.0)
+    app.rssi_var.set(-40.0)
+    app.fails_var.set(3)
+    app.run_access_attempt()
     pump(root, 300)
-    check("one OTP sent over BLE", len(app.link.sent) == 1)
-    otp_code, rssi = app.link.sent[0]
-    check("OTP is 6 digits", len(otp_code) == 6)
-    check("OTP entry enabled",
-          str(app.otp_entry.cget("state")) == "normal")
+    check("still no OTP issued", len(app.link.sent) == 0)
+    check("still Unlocked", "Unlocked" in app.result_lbl.cget("text"))
 
-    # wrong code first (failure 1/3)
-    app.otp_var.set("000000" if otp_code != "000000" else "000001")
+    # -- 3. Low tier: 4-digit OTP, wrong x3 -> hard lock ---------------------
+    print("\\n[3] Low tier: 3 wrong tries -> HARD LOCK")
+    app.fp_var.set(80.0)                    # risk 10.0 -> Low, not perfect
+    app.rssi_var.set(-55.0)
+    app.fails_var.set(0)
+    app.run_access_attempt()
+    pump(root, 300)
+    check("one 4-digit OTP sent", len(app.link.sent) == 1
+          and len(app.link.sent[0][0]) == 4)
+    check("tries counter initialised to 3", app.tries_left == 3)
+
+    app.otp_var.set("0000" if app.link.sent[0][0] != "0000" else "0001")
     app.verify_otp()
     pump(root, 150)
-    check("wrong OTP rejected",
-          "denied" in app.result_lbl.cget("text").lower())
-
-    # correct code
-    app.otp_var.set(otp_code)
+    app.otp_var.set("0000" if app.link.sent[1][0] != "0000" else "0001")
     app.verify_otp()
     pump(root, 150)
-    check("correct OTP unlocks", "Unlocked" in app.result_lbl.cget("text"))
+    app.otp_var.set("0000" if app.link.sent[2][0] != "0000" else "0001")
+    app.verify_otp()                        # 3rd wrong -> exhausted
+    pump(root, 150)
+    check("hard lock engaged", app.hard_locked is True)
+    check("RUN disabled", str(app.run_btn.cget("state")) == "disabled")
+    check("OTP entry disabled",
+          str(app.otp_entry.cget("state")) == "disabled")
+    check("Reset button enabled",
+          str(app.reset_btn.cget("state")) == "normal")
+    check("status mentions HARD LOCK",
+          "HARD LOCK" in app.result_lbl.cget("text"))
 
-    # -- 3. Replay: re-submitting the same OTP must be rejected ------------
-    print("\n[3] Anti-replay check")
-    app.otp_var.set(otp_code)
+    # -- 4. Reset lock recovers ----------------------------------------------
+    print("\\n[4] Reset lock")
+    app.reset_lock()
+    pump(root, 150)
+    check("hard lock cleared", app.hard_locked is False)
+    check("RUN re-enabled", str(app.run_btn.cget("state")) == "normal")
+
+    # -- 5. Medium tier: wrong, wrong, correct -------------------------------
+    print("\\n[5] Medium tier: 6-digit OTP, 3 tries")
+    app.fp_var.set(65.0)
+    app.rssi_var.set(-68.0)
+    app.fails_var.set(2)
+    app.run_access_attempt()
+    pump(root, 300)
+    check("6-digit OTP sent", len(app.link.sent[-1][0]) == 6)
+    med1 = app.link.sent[-1][0]
+
+    app.otp_var.set("000000" if med1 != "000000" else "000001")
+    app.verify_otp()
+    pump(root, 150)
+    app.otp_var.set("000000" if med1 != "000000" else "000001")
+    app.verify_otp()
+    pump(root, 150)
+    check("fresh OTP re-issued after each failure",
+          len(app.link.sent) >= 4)
+    med3 = app.link.sent[-1][0]
+    check("on final try before verify", app.tries_left == 1)
+    check("app expects the latest issued code",
+          app.active_otp is not None and app.active_otp[0] == med3)
+
+    app.otp_var.set(med3)
+    app.verify_otp()
+    pump(root, 150)
+    check("correct OTP unlocks on final try",
+          "Unlocked" in app.result_lbl.cget("text"))
+
+    # -- 6. Replay: re-submitting the consumed code is rejected ----------------
+    print("\\n[6] Anti-replay check")
+    replay_code = app.link.sent[-1][0]      # the code just consumed
+    # No new challenge is opened: the attacker re-submits the code they
+    # captured from the just-consumed session.
+    app.otp_var.set(replay_code)
     app.verify_otp()
     pump(root, 150)
     check("replayed OTP rejected",
           "replay" in app.result_lbl.cget("text").lower())
+    check("no session was active (consumption is per-session)",
+          app.active_otp is None)
 
-    # -- 4. High-risk scenario: 8-digit OTP + lockout ----------------------
-    print("\n[4] Spoof/Anomaly scenario (high risk)")
-    app._apply_scenario("Spoof / Anomaly")
+    # -- 7. High tier: single 8-digit try, wrong -> hard lock ------------------
+    print("\\n[7] High tier: 1 try -> HARD LOCK")
+    app.reset_lock()                        # clear the Med partial state
+    app.fp_var.set(15.0)
+    app.rssi_var.set(-82.0)
+    app.fails_var.set(3)
+    app.run_access_attempt()
     pump(root, 300)
-    check("one more OTP sent", len(app.link.sent) == 2)
-    code8, _ = app.link.sent[1]
-    check("OTP is 8 digits", len(code8) == 8)
-
+    check("8-digit OTP sent", len(app.link.sent[-1][0]) == 8)
+    code8 = app.link.sent[-1][0]
     app.otp_var.set("99999999" if code8 != "99999999" else "99999998")
     app.verify_otp()
-    pump(root, 100)
-    app.otp_var.set("88888888" if code8 != "88888888" else "88888887")
-    app.verify_otp()
-    pump(root, 100)
-    app.otp_var.set("77777777" if code8 != "77777777" else "77777776")
-    app.verify_otp()                    # 3rd failure -> lockout
-    pump(root, 1400)                    # let a 1 Hz _tick pass first
-    check("lockout engaged", app.lockout_until > 0)
-    check("run button disabled", str(app.run_btn.cget("state")) == "disabled")
+    pump(root, 150)
+    check("hard lock after single wrong try", app.hard_locked is True)
+    check("status mentions HARD LOCK",
+          "HARD LOCK" in app.result_lbl.cget("text"))
 
-    # -- 5. Vault: seal -> authorised unlock -> auto-decrypt ---------------
-    print("\n[5] AES-256-GCM vault flow")
-    app.lockout_until = 0.0             # skip the wait for the test
-    app.run_btn.config(state="normal")
+    # -- 8. Vault: seal -> authorised unlock -> auto-decrypt --------------------
+    print("\\n[8] AES-256-GCM vault flow")
+    app.reset_lock()
     app.create_sample_vault()
     app.root.update()
     vault.seal_folder(app.vault_dir, DEMO_PASSPHRASE)
     app._refresh_vault_label()
     check("vault sealed", vault.is_sealed(app.vault_dir))
 
-    app.fp_var.set(95.0)
-    app.rssi_var.set(-42.0)
+    app.fp_var.set(100.0)
+    app.rssi_var.set(-45.0)
     app.fails_var.set(0)
-    app.run_access_attempt()            # low risk -> unlock -> auto-unseal
+    app.run_access_attempt()                # perfect -> unlock -> auto-unseal
     pump(root, 300)
     check("vault auto-decrypted after unlock",
           not vault.is_sealed(app.vault_dir))
 
-    # -- 6. Audit log integrity --------------------------------------------
-    print("\n[6] Audit log")
+    # -- 9. Audit log integrity --------------------------------------------------
+    print("\\n[9] Audit log")
     ok, msg = audit.verify_chain()
     check("hash chain intact", ok)
     rows = audit.fetch_all()
-    check(f"rows logged ({len(rows)})", len(rows) >= 6)
+    check(f"rows logged ({len(rows)})", len(rows) >= 12)
     check("replay flag persisted",
           any(r["token_replay"] for r in rows))
-    check("lockout status persisted",
-          any("lockout" in (r["status"] or "").lower() for r in rows))
+    check("hard-lock statuses persisted",
+          sum("HARD LOCK" in (r["status"] or "") for r in rows) >= 2)
+    check("reset events persisted",
+          any("reset" in (r["status"] or "").lower() for r in rows))
+    check("perfect-match events persisted",
+          any("perfect match" in (r["status"] or "").lower()
+              for r in rows))
 
     root.destroy()
     audit.close()
 
-    print("\n" + "=" * 60)
+    print("\\n" + "=" * 60)
     failed = [c for c, ok in checks if not ok]
     if failed:
         print(f" SMOKE FAILED - {len(failed)} check(s):")
         for label in failed:
             print(f"   - {label}")
         return 1
-    print(" SMOKE PASSED - GUI flow fully operational.")
+    print(" SMOKE PASSED - policy v2 GUI flow fully operational.")
     return 0
 
 

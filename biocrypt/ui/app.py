@@ -6,8 +6,16 @@ Single-window Lock dashboard:
   * Module 2 (right): live risk gauge + 3-tier routing decision.
   * Bottom:           vault (AES-256-GCM seal/unseal) + audit log viewer.
 
-On Med/High risk the TOTP challenge is delivered over the simulated BLE
-link to the Trusted Device window; the user re-enters it here (the LOCK).
+Challenge policy (v2):
+  * Perfect match (fp = 100% AND RSSI >= -50 dBm): no OTP, instant unlock.
+  * Low:  4-digit OTP, 3 tries, no timeout.
+  * Med:  6-digit OTP, 3 tries, 90 s per try.
+  * High: 8-digit OTP, 1 try, 60 s timeout.
+  * Exhausted tries (wrong entry / expiry / replay) on ANY tier -> HARD
+    LOCK: RUN and OTP entry stay disabled until "Reset lock" or restart.
+
+On OTP tiers the challenge is delivered over the simulated BLE link to the
+Trusted Device window; the user re-enters it here (the LOCK).
 """
 
 from __future__ import annotations
@@ -24,8 +32,8 @@ from ..audit.logger import AuditLogger, AuditRecord
 from ..crypto import vault
 from ..engine import totp
 from ..engine.risk_engine import compute_risk
-from ..engine.tiers import (LOCKOUT_SECONDS, OTP_HIGH_DIGITS, OTP_MED_DIGITS,
-                            TIER_HIGH, TIER_LOW, TIER_MED, route_tier)
+from ..engine.tiers import (TIER_HIGH, TIER_LOW, TIER_MED, is_perfect_match,
+                            route_tier)
 from .ble_link import BleLink
 from .device_window import TrustedDeviceWindow
 
@@ -40,15 +48,18 @@ MUTED = "#5bc0be"
 
 TIER_COLORS = {TIER_LOW: ACCENT, TIER_MED: WARN, TIER_HIGH: DANGER}
 
+# Demo scenarios (retuned for policy v2):
+#   Trusted User  -> PERFECT match (fp=100, rssi=-45) -> instant unlock
+#   Moderate Risk -> risk 32.50 -> Med (6-digit OTP)
+#   Spoof         -> risk 71.50 -> High (8-digit OTP, 1 try)
 SCENARIOS = {
-    "Trusted User": dict(fp=95, rssi=-42, fails=0),      # risk 2.5  Low
-    "Moderate Risk": dict(fp=65, rssi=-68, fails=2),     # risk 32.5 Med
-    "Spoof / Anomaly": dict(fp=15, rssi=-82, fails=3),   # risk 71.5 High
+    "Trusted User": dict(fp=100, rssi=-45, fails=0),
+    "Moderate Risk": dict(fp=65, rssi=-68, fails=2),
+    "Spoof / Anomaly": dict(fp=15, rssi=-82, fails=3),
 }
 
 VAULT_DIRNAME = "secure_vault"
 DEMO_PASSPHRASE = "biocrypt-demo"   # fixed demo key (shown on the UI)
-MAX_OTP_FAILURES = 3                # failures before live lockout engages
 
 
 class BioCryptApp:
@@ -61,11 +72,12 @@ class BioCryptApp:
         self.device = TrustedDeviceWindow(self.link, master=root)
 
         self.totp_secret = totp.generate_secret()
-        self.used_codes: set[str] = set()
 
         self.active_otp: tuple[str, int] | None = None   # (code, digits)
-        self.otp_failures = 0
-        self.lockout_until = 0.0
+        self._pending: tuple | None = None               # (risk, decision)
+        self.tries_left = 0
+        self.try_deadline = 0.0                          # 0 = no timeout
+        self.hard_locked = False
         self.vault_dir: str | None = None
 
         self._build_ui()
@@ -122,12 +134,12 @@ class BioCryptApp:
         tk.Label(panel, text="Fingerprint optical match score (%)",
                  font=("Segoe UI", 9), fg=MUTED, bg=PANEL).pack(
             anchor="w", pady=(12, 0))
-        self.fp_var = tk.DoubleVar(value=95.0)
+        self.fp_var = tk.DoubleVar(value=100.0)
         fp_scale = ttk.Scale(panel, from_=0, to=100, variable=self.fp_var,
                              command=lambda *_: self._refresh_fp_label())
         fp_scale.pack(fill="x")
-        self.fp_val_lbl = tk.Label(panel, text="95 %", font=("Consolas", 11,
-                                                             "bold"),
+        self.fp_val_lbl = tk.Label(panel, text="100 %", font=("Consolas", 11,
+                                                              "bold"),
                                    fg=TEXT, bg=PANEL)
         self.fp_val_lbl.pack(anchor="e")
 
@@ -135,11 +147,11 @@ class BioCryptApp:
         tk.Label(panel, text="BLE RSSI signal strength (dBm)",
                  font=("Segoe UI", 9), fg=MUTED, bg=PANEL).pack(
             anchor="w", pady=(10, 0))
-        self.rssi_var = tk.DoubleVar(value=-42.0)
+        self.rssi_var = tk.DoubleVar(value=-45.0)
         rssi_scale = ttk.Scale(panel, from_=-90, to=-30, variable=self.rssi_var,
                                command=lambda *_: self._refresh_rssi_label())
         rssi_scale.pack(fill="x")
-        self.rssi_val_lbl = tk.Label(panel, text="-42 dBm",
+        self.rssi_val_lbl = tk.Label(panel, text="-45 dBm",
                                      font=("Consolas", 11, "bold"),
                                      fg=TEXT, bg=PANEL)
         self.rssi_val_lbl.pack(anchor="e")
@@ -175,13 +187,21 @@ class BioCryptApp:
                       ).grid(row=0, column=i, padx=2, sticky="nsew")
             row.columnconfigure(i, weight=1)
 
-        # Run button
+        # Run / Reset buttons
         self.run_btn = tk.Button(
             panel, text="▶  RUN ACCESS ATTEMPT",
             font=("Segoe UI", 12, "bold"), relief="flat",
             bg=ACCENT, fg=BG, activebackground="#00c98c", activeforeground=BG,
             command=self.run_access_attempt)
         self.run_btn.pack(fill="x", pady=(16, 2), ipady=6)
+
+        self.reset_btn = tk.Button(
+            panel, text="⟳  RESET LOCK (unlock console after hard lock)",
+            font=("Segoe UI", 9, "bold"), relief="flat",
+            bg="#3a506b", fg=TEXT, activebackground="#4a607d",
+            activeforeground=TEXT, state="disabled",
+            command=self.reset_lock)
+        self.reset_btn.pack(fill="x", pady=(2, 2), ipady=3)
 
         self.lockout_lbl = tk.Label(panel, text="", font=("Segoe UI", 9,
                                                           "bold"),
@@ -349,44 +369,68 @@ class BioCryptApp:
             pass
 
     def _tick(self) -> None:
-        """1 Hz housekeeping: OTP countdown + lockout countdown."""
+        """1 Hz housekeeping: TOTP-window countdown + per-try deadline."""
         now = time.time()
         if self.active_otp:
             secs = totp.seconds_remaining(now)
-            digits = self.active_otp[1]
             self.otp_countdown_lbl.config(
-                text=f"OTP valid for {secs}s (30 s TOTP window)")
-        if self.lockout_until:
-            remain = int(self.lockout_until - now)
-            if remain > 0:
-                self.lockout_lbl.config(
-                    text=f"⏳ LOCKOUT ACTIVE — {remain}s remaining")
-                self.run_btn.config(state="disabled")
-            else:
-                self.lockout_until = 0.0
-                self.otp_failures = 0
-                self.lockout_lbl.config(text="")
-                self.run_btn.config(state="normal")
+                text=self._challenge_status(secs))
+        if (self.active_otp and self.try_deadline
+                and now > self.try_deadline):
+            self._handle_try_expiry()
         self.root.after(1000, self._tick)
+
+    def _challenge_status(self, totp_secs: int) -> str:
+        """Countdown text: per-try deadline (Med/High) + 30 s TOTP window."""
+        parts = []
+        if self.try_deadline:
+            left = max(0, int(self.try_deadline - time.time()))
+            parts.append(f"try expires in {left}s")
+        parts.append(f"code rotates in {totp_secs}s (30 s TOTP window)")
+        return " · ".join(parts)
 
     # ==================================================================
     # Core flow: access attempt
     # ==================================================================
     def run_access_attempt(self) -> None:
-        if time.time() < self.lockout_until:
-            remain = int(self.lockout_until - time.time())
-            self._log_attempt(status=f"Blocked — lockout active ({remain}s)",
-                              otp_entered="")
-            messagebox.showwarning("Lockout active",
-                                   f"High-risk lockout in effect for "
-                                   f"{remain}s more.")
-            return
-
         fp = float(self.fp_var.get())
         rssi = float(self.rssi_var.get())
         fails = int(self.fails_var.get())
 
+        # Clear any previous challenge state before evaluating.
+        self.active_otp = None
+        self.try_deadline = 0.0
+        self.otp_entry.config(state="disabled")
+        self.verify_btn.config(state="disabled")
+        self.otp_var.set("")
+        self.otp_countdown_lbl.config(text="")
+
+        if self.hard_locked:
+            self._log_attempt(status="Blocked — hard lock, reset required",
+                              otp_entered="")
+            messagebox.showwarning(
+                "Hard lock active",
+                "Tries exhausted. Click 'Reset lock' to try again.")
+            return
+
         risk = compute_risk(fp, rssi, fails)
+        perfect = is_perfect_match(fp, rssi)
+        if perfect:
+            # Bypasses the tier decision entirely — the spec's override rule.
+            self._draw_gauge(risk.total_risk, ACCENT)
+            self.breakdown_lbl.config(
+                text=f"biometric {risk.components['biometric']:>5.2f}  ·  "
+                     f"proximity {risk.components['proximity']:>5.2f}  ·  "
+                     f"history {risk.components['history']:>5.2f}")
+            self.tier_lbl.config(text="TIER: PERFECT MATCH", fg=ACCENT)
+            self.action_lbl.config(
+                text="Fingerprint and BLE both perfect — "
+                     "no OTP required, instant unlock.")
+            self._finish_attempt(risk, None, otp_entered="", otp_valid=True,
+                                 otp_reason="not-required",
+                                 status="Unlocked — perfect match, no OTP")
+            return
+
         decision = route_tier(risk.total_risk)
 
         self._draw_gauge(risk.total_risk, TIER_COLORS[decision.tier])
@@ -399,71 +443,163 @@ class BioCryptApp:
         self.action_lbl.config(text=decision.action)
         self.result_lbl.config(text="", fg=TEXT)
 
-        self.active_otp = None
-        self.otp_entry.config(state="disabled")
-        self.verify_btn.config(state="disabled")
-        self.otp_var.set("")
+        self.tries_left = decision.otp_tries
+        self.try_deadline = (time.time() + decision.otp_timeout_s
+                             if decision.otp_timeout_s > 0 else 0.0)
 
-        if not decision.requires_otp:
-            self._finish_attempt(risk, decision, otp_entered="",
-                                 otp_valid=True, otp_reason="not-required",
-                                 status="Unlocked — single factor")
-            return
+        self._issue_otp(decision, risk)
+        self._pending = (risk, decision)
 
-        # Medium / High: issue TOTP over the simulated BLE link
+    # ------------------------------------------------------------------
+    def _issue_otp(self, decision, risk) -> None:
+        """Fresh code over BLE; consumes nothing — used on issue and retry."""
         code = totp.current_totp(self.totp_secret, decision.otp_digits)
         self.active_otp = (code, decision.otp_digits)
-        self.link.send_otp(code, rssi)
+        self.link.send_otp(code, float(self.rssi_var.get()))
 
         self.otp_entry.config(state="normal")
         self.otp_entry.delete(0, "end")
         self.otp_entry.focus_set()
         self.verify_btn.config(state="normal")
+        self.otp_countdown_lbl.config(text=self._challenge_status(
+            totp.seconds_remaining()))
 
-        self._pending = (risk, decision)   # held until OTP verdict
-        self.otp_countdown_lbl.config(text="OTP window: 30 s")
+    def _challenge_label(self, decision) -> str:
+        timeout = (f", {decision.otp_timeout_s}s per try"
+                   if decision.otp_timeout_s else ", no timeout")
+        return (f"{decision.otp_digits}-digit OTP · "
+                f"{self.tries_left}/{decision.otp_tries} tries left"
+                f"{timeout}")
 
-    # ------------------------------------------------------------------
     def verify_otp(self) -> None:
-        if not self.active_otp or not getattr(self, "_pending", None):
-            return
-        risk, decision = self._pending
         code = self.otp_var.get().strip()
+
+        # No open challenge: any submitted code is a replay/reuse attempt.
+        if not self.active_otp or not self._pending:
+            if code:
+                self._log_attempt(otp_entered=code, otp_valid=False,
+                                  otp_reason="replay", token_replay=True,
+                                  status="Blocked — no active challenge; "
+                                         "code re-submission flagged (replay)")
+                self.result_lbl.config(
+                    text="✖ Code rejected — no active challenge "
+                         "(replay attempt logged)", fg=DANGER)
+            return
+
+        risk, decision = self._pending
         digits = decision.otp_digits
 
-        ok, reason = totp.verify_totp(self.totp_secret, digits, code,
-                                      used_codes=self.used_codes)
-        replay = (reason == "replay")
+        # Cryptographic validity (shape + 30 s window ±1).
+        crypto_ok, crypto_reason = totp.verify_totp(
+            self.totp_secret, digits, code)
 
-        if ok:
-            self.otp_failures = 0
+        if crypto_ok and code == self.active_otp[0]:
+            # Success closes the challenge session: the code is consumed —
+            # it can never satisfy another verification.
+            self.active_otp = None
+            self._pending = None
+            self.tries_left = 0
+            self.try_deadline = 0.0
+            self.verify_btn.config(state="normal")   # re-submit -> replay log
+            self.otp_var.set("")
+            self.otp_countdown_lbl.config(text="")
+            # Entry stays enabled so a re-submission is visibly logged
+            # as a replay attempt (the panel-ready anti-replay demo).
             self._finish_attempt(
                 risk, decision, otp_entered=code, otp_valid=True,
                 otp_reason="ok",
                 status=f"Unlocked — {digits}-digit OTP verified")
             return
 
-        self.otp_failures += 1
-        if self.otp_failures >= MAX_OTP_FAILURES:
-            self._start_lockout()
+        # Valid TOTP value but not THIS challenge's code -> replay.
+        reason = "replay" if crypto_ok else crypto_reason
+        replay = (reason == "replay")
+
+        # Any failure (wrong / expired / replay) consumes one try.
+        self.tries_left -= 1
+        if self.tries_left <= 0:
+            self._hard_lock()
             self._finish_attempt(
                 risk, decision, otp_entered=code, otp_valid=False,
                 otp_reason=reason, token_replay=replay, otp_issued=True,
-                status=f"Access denied — {reason} "
-                       f"({MAX_OTP_FAILURES} failures → lockout)")
+                status=f"Access denied — {reason} · tries exhausted"
+                       f" → HARD LOCK (reset required)")
             return
 
+        # Tries remain: fresh code for the next attempt.
+        self._issue_otp(decision, risk)
         self._finish_attempt(
             risk, decision, otp_entered=code, otp_valid=False,
             otp_reason=reason, token_replay=replay, otp_issued=True,
-            status=f"Access denied — {reason} "
-                   f"(failure {self.otp_failures}/{MAX_OTP_FAILURES})")
+            status=f"Access denied — {reason} · "
+                   f"try {decision.otp_tries - self.tries_left}"
+                   f"/{decision.otp_tries} failed, fresh OTP issued")
 
-    def _start_lockout(self) -> None:
-        self.lockout_until = time.time() + LOCKOUT_SECONDS
+    def _handle_try_expiry(self) -> None:
+        """Per-try timeout (Med/High only): consume a try, re-issue or lock."""
+        if not self.active_otp or not self._pending:
+            return
+        risk, decision = self._pending
         self.active_otp = None
         self.otp_entry.config(state="disabled")
         self.verify_btn.config(state="disabled")
+        self.otp_var.set("")
+
+        self.tries_left -= 1
+        if self.tries_left <= 0:
+            self._hard_lock()
+            self._log_attempt(
+                risk=risk, decision=decision, otp_issued=True,
+                otp_digits=decision.otp_digits, otp_entered="",
+                otp_valid=False, otp_reason="timeout",
+                status="Access denied — timeout · tries exhausted"
+                       " → HARD LOCK (reset required)")
+            self.result_lbl.config(
+                text="✖ Try timed out — tries exhausted → HARD LOCK",
+                fg=DANGER)
+            return
+
+        self.try_deadline = (time.time() + decision.otp_timeout_s
+                             if decision.otp_timeout_s > 0 else 0.0)
+        self._issue_otp(decision, risk)
+        self._log_attempt(
+            risk=risk, decision=decision, otp_issued=True,
+            otp_digits=decision.otp_digits, otp_entered="",
+            otp_valid=False, otp_reason="timeout",
+            status=f"Try timed out — fresh OTP issued "
+                   f"(try {decision.otp_tries - self.tries_left}"
+                   f"/{decision.otp_tries})")
+        self.result_lbl.config(
+            text=f"⏳ Try timed out — {self.tries_left} "
+             f"try/tries left, fresh OTP sent to device", fg=WARN)
+
+    def _hard_lock(self) -> None:
+        """Uniform exhaustion policy: disable everything until reset."""
+        self.hard_locked = True
+        self.active_otp = None
+        self.try_deadline = 0.0
+        self.otp_entry.config(state="disabled")
+        self.verify_btn.config(state="disabled")
+        self.otp_var.set("")
+        self.otp_countdown_lbl.config(text="")
+        self.run_btn.config(state="disabled")
+        self.reset_btn.config(state="normal")
+
+    def reset_lock(self) -> None:
+        """Manual reset — the ONLY way out of a hard lock (besides restart)."""
+        if not self.hard_locked:
+            return
+        self.hard_locked = False
+        self.tries_left = 0
+        self.try_deadline = 0.0
+        self._pending = None
+        self.run_btn.config(state="normal")
+        self.reset_btn.config(state="disabled")
+        self.lockout_lbl.config(text="")
+        self.result_lbl.config(text="Lock reset — new attempt required",
+                               fg=WARN)
+        self._log_attempt(status="Lock reset (manual) — new attempt required",
+                          otp_entered="")
 
     # ------------------------------------------------------------------
     def _finish_attempt(self, risk, decision, *, otp_entered: str,
@@ -474,7 +610,8 @@ class BioCryptApp:
             otp_issued = bool(self.active_otp)
         self._log_attempt(
             risk=risk, decision=decision, otp_issued=otp_issued,
-            otp_digits=decision.otp_digits if decision.requires_otp else 0,
+            otp_digits=getattr(decision, "otp_digits", 0)
+            if decision and getattr(decision, "requires_otp", False) else 0,
             otp_entered=otp_entered, otp_valid=otp_valid,
             otp_reason=otp_reason, token_replay=token_replay,
             status=status)
@@ -499,7 +636,8 @@ class BioCryptApp:
             proximity_risk=getattr(risk, "proximity_risk", 0.0),
             history_risk=getattr(risk, "history_risk", 0.0),
             risk_score=getattr(risk, "total_risk", 0.0),
-            tier=getattr(decision, "tier", "n/a"),
+            tier=(getattr(decision, "tier", None)
+                  or getattr(risk, "tier", "n/a")),
             otp_issued=otp_issued,
             otp_digits=otp_digits,
             otp_entered=otp_entered,
@@ -637,7 +775,7 @@ class BioCryptApp:
         if not path:
             return
         n = self.audit.export_csv(path)
-        messagebox.showinfo("Export complete", f"{n} rows written to\n{path}")
+        messagebox.showinfo("Export complete", f"{n} rows written to\\n{path}")
 
     def verify_chain(self) -> None:
         ok, msg = self.audit.verify_chain()

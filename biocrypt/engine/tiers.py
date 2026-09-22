@@ -1,8 +1,19 @@
 """3-Tier Risk-Adaptive Authentication Router — Bio-Crypt Lock.
 
-    Low  (risk <= 30):  seamless 1-touch unlock, no OTP.
-    Med  (31..70):      6-digit TOTP step-up challenge.
-    High (71..100):     8-digit TOTP challenge + timed lockout protocol.
+Policy (v2 — "hard lock on exhaustion"):
+
+    Perfect match : fingerprint = 100%  AND  RSSI >= -50 dBm
+                    -> no OTP, instant unlock (even with failed attempts
+                       on record).
+
+    Low  (risk <= 30):  4-digit OTP, 3 tries, no per-try timeout.
+    Med  (31..70):      6-digit OTP, 3 tries, 90 s timeout per try.
+    High (71..100):     8-digit OTP, 1 try,  60 s timeout.
+
+Exhaustion (all tiers): running out of tries — by wrong entries, expired
+timeouts, or replays — HARD-LOCKS the lock. No automatic recovery: the
+user must trigger an explicit reset (Reset lock button / app restart).
+Every event, including resets, is audit-logged.
 """
 
 from __future__ import annotations
@@ -15,10 +26,26 @@ TIER_LOW = "Low Risk (0-30)"
 TIER_MED = "Medium Risk (31-70)"
 TIER_HIGH = "High Risk (71-100)"
 
+# ---- perfect-match instant unlock ----------------------------------------
+PERFECT_FP = 100.0         # required fingerprint match (%)
+PERFECT_RSSI_DBM = -50.0   # required BLE RSSI (>= this value = adjacent)
+
+# ---- per-tier OTP challenge policy ---------------------------------------
+OTP_LOW_DIGITS = 4
+OTP_LOW_TRIES = 3
+OTP_LOW_TIMEOUT_S = 0      # 0 = no per-try timeout
+
 OTP_MED_DIGITS = 6
+OTP_MED_TRIES = 3
+OTP_MED_TIMEOUT_S = 90     # per-try timeout; expiry consumes one try
+
 OTP_HIGH_DIGITS = 8
-LOCKOUT_SECONDS = 60          # timed lockout for the high-risk protocol
-LOW_MAX_ATTEMPTS = 2          # OTP verification tries allowed before reset
+OTP_HIGH_TRIES = 1
+OTP_HIGH_TIMEOUT_S = 60
+
+# Old timed-lockout behaviour is replaced by the uniform hard lock;
+# the constant is kept (as 0) only so older imports keep working.
+LOCKOUT_SECONDS = 0
 
 
 @dataclass(frozen=True)
@@ -26,9 +53,21 @@ class TierDecision:
     tier: str
     requires_otp: bool
     otp_digits: int
-    lockout_seconds: int
+    otp_tries: int
+    otp_timeout_s: int        # 0 = no per-try timeout
+    hard_lock_on_exhaust: bool
     action: str
     status: str
+
+
+def is_perfect_match(fp_match_score: float, rssi_dbm: float) -> bool:
+    """True when BOTH signals are perfect: fp = 100% AND RSSI >= -50 dBm.
+
+    Deliberately ignores attempt history — perfect signals always unlock,
+    per the approved spec.
+    """
+    return (float(fp_match_score) >= PERFECT_FP
+            and float(rssi_dbm) >= PERFECT_RSSI_DBM)
 
 
 def classify_tier(risk_score: float) -> str:
@@ -47,27 +86,36 @@ def route_tier(risk_score: float) -> TierDecision:
     if tier == TIER_LOW:
         return TierDecision(
             tier=tier,
-            requires_otp=False,
-            otp_digits=0,
-            lockout_seconds=0,
-            action="Seamless 1-touch unlock (no OTP required)",
-            status="Unlocked — single factor",
+            requires_otp=True,
+            otp_digits=OTP_LOW_DIGITS,
+            otp_tries=OTP_LOW_TRIES,
+            otp_timeout_s=OTP_LOW_TIMEOUT_S,
+            hard_lock_on_exhaust=True,
+            action=f"Low-risk protocol: {OTP_LOW_DIGITS}-digit OTP, "
+                   f"{OTP_LOW_TRIES} tries, no timeout",
+            status="Pending OTP verification",
         )
     if tier == TIER_MED:
         return TierDecision(
             tier=tier,
             requires_otp=True,
             otp_digits=OTP_MED_DIGITS,
-            lockout_seconds=0,
-            action=f"Dynamic {OTP_MED_DIGITS}-digit TOTP step-up required",
+            otp_tries=OTP_MED_TRIES,
+            otp_timeout_s=OTP_MED_TIMEOUT_S,
+            hard_lock_on_exhaust=True,
+            action=f"Medium-risk protocol: {OTP_MED_DIGITS}-digit OTP, "
+                   f"{OTP_MED_TRIES} tries, {OTP_MED_TIMEOUT_S} s per try",
             status="Pending OTP verification",
         )
     return TierDecision(
         tier=tier,
         requires_otp=True,
         otp_digits=OTP_HIGH_DIGITS,
-        lockout_seconds=LOCKOUT_SECONDS,
-        action=f"High-risk protocol: {OTP_HIGH_DIGITS}-digit TOTP + "
-               f"{LOCKOUT_SECONDS}s timed lockout",
+        otp_tries=OTP_HIGH_TRIES,
+        otp_timeout_s=OTP_HIGH_TIMEOUT_S,
+        hard_lock_on_exhaust=True,
+        action=f"High-risk protocol: {OTP_HIGH_DIGITS}-digit OTP, "
+               f"{OTP_HIGH_TRIES} try, {OTP_HIGH_TIMEOUT_S} s timeout — "
+               f"failure locks the console until reset",
         status="Lockout enforced",
     )

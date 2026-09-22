@@ -7,9 +7,13 @@ import pytest
 from biocrypt.engine import totp
 from biocrypt.engine.risk_engine import (compute_risk,
                                          proximity_risk_from_rssi)
-from biocrypt.engine.tiers import (TIER_HIGH, TIER_LOW, TIER_MED,
-                                   LOCKOUT_SECONDS, OTP_HIGH_DIGITS,
-                                   OTP_MED_DIGITS, classify_tier, route_tier)
+from biocrypt.engine.tiers import (OTP_HIGH_DIGITS, OTP_HIGH_TIMEOUT_S,
+                                   OTP_HIGH_TRIES, OTP_LOW_DIGITS,
+                                   OTP_LOW_TIMEOUT_S, OTP_LOW_TRIES,
+                                   OTP_MED_DIGITS, OTP_MED_TIMEOUT_S,
+                                   OTP_MED_TRIES, TIER_HIGH, TIER_LOW,
+                                   TIER_MED, classify_tier, is_perfect_match,
+                                   route_tier)
 
 
 # ---------------------------------------------------------------------------
@@ -72,20 +76,52 @@ class TestTiers:
     def test_boundaries(self, score, expected):
         assert classify_tier(score) == expected
 
-    def test_low_route_unlocks_without_otp(self):
+    def test_low_route_policy(self):
         d = route_tier(20)
-        assert not d.requires_otp and d.otp_digits == 0
-        assert "unlock" in d.action.lower()
+        assert d.tier == TIER_LOW and d.requires_otp
+        assert d.otp_digits == OTP_LOW_DIGITS == 4
+        assert d.otp_tries == OTP_LOW_TRIES == 3
+        assert d.otp_timeout_s == OTP_LOW_TIMEOUT_S == 0
+        assert d.hard_lock_on_exhaust
 
-    def test_med_route_6_digit_otp(self):
+    def test_med_route_policy(self):
         d = route_tier(50)
-        assert d.requires_otp and d.otp_digits == OTP_MED_DIGITS == 6
-        assert d.lockout_seconds == 0
+        assert d.tier == TIER_MED and d.requires_otp
+        assert d.otp_digits == OTP_MED_DIGITS == 6
+        assert d.otp_tries == OTP_MED_TRIES == 3
+        assert d.otp_timeout_s == OTP_MED_TIMEOUT_S == 90
+        assert d.hard_lock_on_exhaust
 
-    def test_high_route_8_digit_otp_and_lockout(self):
+    def test_high_route_policy(self):
         d = route_tier(90)
-        assert d.requires_otp and d.otp_digits == OTP_HIGH_DIGITS == 8
-        assert d.lockout_seconds == LOCKOUT_SECONDS == 60
+        assert d.tier == TIER_HIGH and d.requires_otp
+        assert d.otp_digits == OTP_HIGH_DIGITS == 8
+        assert d.otp_tries == OTP_HIGH_TRIES == 1
+        assert d.otp_timeout_s == OTP_HIGH_TIMEOUT_S == 60
+        assert d.hard_lock_on_exhaust
+
+
+class TestPerfectMatch:
+    def test_true_when_both_signals_perfect(self):
+        assert is_perfect_match(100.0, -45.0) is True
+        assert is_perfect_match(100.0, -50.0) is True    # boundary inclusive
+        assert is_perfect_match(100.0, -30.0) is True
+
+    def test_false_when_any_signal_imperfect(self):
+        assert is_perfect_match(99.9, -45.0) is False
+        assert is_perfect_match(100.0, -50.01) is False
+        assert is_perfect_match(85.0, -42.0) is False
+
+    def test_overrides_failed_attempts(self):
+        # Perfect signals always unlock, even with failures on record.
+        assert is_perfect_match(100.0, -40.0) is True
+
+    def test_independent_of_risk_score(self):
+        # fp=100, rssi=-40 with 0 fails scores 0.0 (Low); the override must
+        # not depend on the computed score, only on the two raw signals.
+        risk = compute_risk(100, -40, 0)
+        assert risk.total_risk == 0.0
+        assert is_perfect_match(100, -40) is True
 
 
 # ---------------------------------------------------------------------------

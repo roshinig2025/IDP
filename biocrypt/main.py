@@ -29,7 +29,13 @@ def _selftest() -> int:
     from biocrypt.crypto import vault
     from biocrypt.engine import totp
     from biocrypt.engine.risk_engine import compute_risk
-    from biocrypt.engine.tiers import TIER_HIGH, TIER_LOW, TIER_MED, route_tier
+    from biocrypt.engine.tiers import (TIER_HIGH, TIER_LOW, TIER_MED,
+                                       OTP_HIGH_DIGITS, OTP_HIGH_TIMEOUT_S,
+                                       OTP_HIGH_TRIES, OTP_LOW_DIGITS,
+                                       OTP_LOW_TIMEOUT_S, OTP_LOW_TRIES,
+                                       OTP_MED_DIGITS, OTP_MED_TIMEOUT_S,
+                                       OTP_MED_TRIES, is_perfect_match,
+                                       route_tier)
 
     print("=" * 62)
     print(" BIO-CRYPT LOCK - SELFTEST (headless)")
@@ -47,7 +53,7 @@ def _selftest() -> int:
     # under the fixed weights (High needs fp <= ~17 because the history
     # component saturates at 30 raw points = 4.5 weighted).
     scenarios = [
-        ("Trusted User",    95.0, -42.0, 0, TIER_LOW,  0.00),
+        ("Trusted User",    100.0, -45.0, 0, TIER_LOW,  0.00),
         ("Moderate Risk",   65.0, -68.0, 2, TIER_MED, 30.00),
         ("Spoof / Anomaly", 15.0, -82.0, 3, TIER_HIGH, 70.00),
     ]
@@ -73,6 +79,32 @@ def _selftest() -> int:
             history_risk=risk.history_risk, risk_score=risk.total_risk,
             tier=decision.tier, otp_issued=decision.requires_otp,
             otp_digits=decision.otp_digits, status=decision.status))
+
+    # ---- Challenge policy v2 ---------------------------------------------
+    print("\n--- Challenge policy (v2)")
+    check("perfect match: fp=100 & rssi=-45 detected",
+          is_perfect_match(100.0, -45.0))
+    check("perfect match: rssi=-51 rejected",
+          not is_perfect_match(100.0, -51.0))
+    check("perfect match: fp=99 rejected",
+          not is_perfect_match(99.0, -45.0))
+    check("perfect match: overrides 3 failed attempts",
+          is_perfect_match(100.0, -40.0))
+    check("Low: 4-digit OTP",
+          route_tier(20).otp_digits == OTP_LOW_DIGITS == 4)
+    check("Low: 3 tries, no timeout",
+          route_tier(20).otp_tries == OTP_LOW_TRIES == 3
+          and route_tier(20).otp_timeout_s == OTP_LOW_TIMEOUT_S == 0)
+    check("Med: 6-digit OTP, 3 tries, 90 s per try",
+          route_tier(50).otp_digits == OTP_MED_DIGITS == 6
+          and route_tier(50).otp_tries == OTP_MED_TRIES == 3
+          and route_tier(50).otp_timeout_s == OTP_MED_TIMEOUT_S == 90)
+    check("High: 8-digit OTP, 1 try, 60 s timeout",
+          route_tier(90).otp_digits == OTP_HIGH_DIGITS == 8
+          and route_tier(90).otp_tries == OTP_HIGH_TRIES == 1
+          and route_tier(90).otp_timeout_s == OTP_HIGH_TIMEOUT_S == 60)
+    check("exhaustion hard-locks on every tier",
+          all(route_tier(s).hard_lock_on_exhaust for s in (20, 50, 90)))
 
     # ---- TOTP + anti-replay --------------------------------------------
     secret = totp.generate_secret()

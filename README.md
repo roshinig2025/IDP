@@ -42,17 +42,26 @@ python tests/gui_smoke.py           # scripted end-to-end GUI test (headless-fri
         + 0.15·min(30, 15·failed_attempts)
    ```
 
-   | Tier | Score | Behaviour |
-   |------|-------|-----------|
-   | Low | 0–30 | Direct unlock, no OTP |
-   | Medium | 31–70 | **6-digit** TOTP challenge |
-   | High | 71–100 | **8-digit** TOTP + 60 s timed lockout |
+   | Case | Condition | Challenge | On tries exhausted |
+   |------|-----------|-----------|--------------------|
+   | **Perfect match** | fp = 100% **AND** RSSI ≥ −50 dBm | **No OTP — instant unlock** (even with failed attempts on record) | — |
+   | **Low** | risk ≤ 30, not a perfect match | **4-digit** OTP, 3 tries, no timeout | **Hard lock** |
+   | **Medium** | 31–70 | **6-digit** OTP, 3 tries, 90 s per try | **Hard lock** |
+   | **High** | ≥ 71 | **8-digit** OTP, 1 try, 60 s timeout | **Hard lock** |
 
-4. **OTP delivery (the demo's centrepiece):** on Medium/High risk the code
+   **Hard lock (uniform rule):** exhausting tries — by wrong entries,
+   expired timeouts (Med/High), or replays — disables RUN and OTP entry
+   with **no automatic recovery**. The only way back in is the
+   **⟳ RESET LOCK** button (or restarting the app); every reset is
+   audit-logged.
+
+4. **OTP delivery (the demo's centrepiece):** on any OTP tier the code
    is transmitted over the simulated BLE channel to the *Trusted Device*
    window — **delay and reliability scale with RSSI** (at −85 dBm the packet
    may arrive garbled; use *Re-sync BLE*). Re-type the code in the Lock
-   console. A replayed code is rejected and flagged in the audit log.
+   console. Each failed try consumes an attempt and issues a fresh code;
+   re-submitting a consumed code — even after a successful unlock — is
+   rejected as **replay** and flagged in the audit log.
 5. **Module 3 — Vault:** *Create sample vault* → *Seal folder…* (AES-256-GCM,
    per-file nonce, path bound as AAD) → the folder now shows `.bcl`
    containers + `manifest.bcl`. On a successful auth the vault
@@ -63,11 +72,16 @@ python tests/gui_smoke.py           # scripted end-to-end GUI test (headless-fri
 
 ### Suggested scenario runs
 
-| Scenario | fp | RSSI | fails | risk | tier |
-|----------|----|------|-------|------|------|
-| Trusted User | 95 | −42 | 0 | 2.50 | Low → direct unlock |
-| Moderate Risk | 65 | −68 | 2 | 32.50 | Med → 6-digit OTP |
-| Spoof / Anomaly | 15 | −82 | 3 | 71.50 | High → 8-digit OTP + lockout |
+| Scenario | fp | RSSI | fails | risk | outcome |
+|----------|----|------|-------|------|---------|
+| Trusted User | 100 | −45 | 0 | 0.00 | Perfect match → instant unlock, no OTP |
+| Moderate Risk | 65 | −68 | 2 | 32.50 | Med → 6-digit OTP, 3 tries × 90 s |
+| Spoof / Anomaly | 15 | −82 | 3 | 71.50 | High → 8-digit OTP, 1 try × 60 s → hard lock on failure |
+
+**Anti-replay demo:** unlock with a Medium-tier code, then immediately
+re-submit the *same* code and verify — the console flags it as a replay
+attempt in the result line and the audit trail (try it: it works even
+though the 30 s TOTP window is still open).
 
 ## Architecture
 
@@ -81,15 +95,15 @@ Fingerprint %   BLE RSSI   Attempt history
         │  ENGINE  (0–100)        │
         └───────────┬─────────────┘
                     ▼
-        ┌─────────────────────────┐
-        │  3-TIER ROUTER          │  biocrypt/engine/tiers.py
-        │  Low / Med / High       │
+        ┌─────────────────────────┐        │  TIERED ROUTER           │  biocrypt/engine/tiers.py
+        │  perfect / Low / Med/Hi  │
         └───────┬─────────┬───────┘
-        no OTP  │         │  TOTP over simulated BLE
+     no OTP     │         │  4/6/8-digit TOTP over simulated BLE
                 ▼         ▼  (biocrypt/ui/ble_link.py → Trusted Device)
         ┌───────────┐ ┌──────────────────┐
-        │ 1-TOUCH   │ │ 6/8-DIGIT TOTP   │ biocrypt/engine/totp.py (RFC 6238,
-        │ UNLOCK    │ │ STEP-UP + LOCKOUT│ single-use anti-replay)
+        │ 1-TOUCH   │ │ TOTP STEP-UP     │ biocrypt/engine/totp.py (RFC 6238,
+        │ UNLOCK    │ │ tries+timeout,   │ single-use per session,
+        │           │ │ HARD LOCK        │ anti-replay)
         └─────┬─────┘ └────────┬─────────┘
               ▼                ▼
         ┌─────────────────────────────┐   ┌──────────────────────────┐
@@ -107,7 +121,7 @@ Fingerprint %   BLE RSSI   Attempt history
 | System design & architecture | Diagram above + modular package split (`engine` / `crypto` / `audit` / `ui`) |
 | Component selection & justification | AES-256-GCM (authenticated encryption), RFC 6238 TOTP, PBKDF2-HMAC-SHA256 (600k iters), SQLite hash chain, RSSI bands |
 | **Initial prototype (~20%)** | Live GUI: sliders → risk score → tier routing → dynamic OTP → file unlock → audit trail |
-| Innovation & feasibility | Dynamic OTP complexity scaling with multi-factor risk; proximity-dependent OTP delivery; non-invertible biometric weighting (only the match *score* is consumed — templates never stored) |
+| Innovation & feasibility | OTP length *and* retry budget scale with multi-factor risk (4/6/8 digits, 3/3/1 tries); perfect-signal instant unlock; proximity-dependent OTP delivery; non-invertible biometric weighting (only the match *score* is consumed — templates never stored) |
 | Q&A defence | Hardware phase next: ESP32 + optical fingerprint module + BLE RSSI feed the same engine via the Module-1 simulator interface |
 
 ## Security notes (defensible in Q&A)
@@ -118,8 +132,11 @@ Fingerprint %   BLE RSSI   Attempt history
   random 16-byte salt); each file sealed with a fresh 12-byte nonce.
 - Original file path is GCM AAD → ciphertexts cannot be swapped between
   files; any tampering fails the GCM tag and aborts the restore.
-- OTPs are single-use; reuse is rejected as **replay** and flagged in the
-  hash-chained audit ledger (editing any historical row breaks the chain).
+- OTPs are single-use **per challenge session**: a consumed code can never
+  satisfy another verification; re-submission — even within the same 30 s
+  window — is rejected as **replay** and flagged in the hash-chained audit
+  ledger (editing any historical row breaks the chain). Exhausting tries
+  hard-locks the console until an explicit, audit-logged reset.
 
 ## Layout
 
