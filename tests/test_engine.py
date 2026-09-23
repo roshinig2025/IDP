@@ -1,10 +1,10 @@
-"""Unit tests — risk engine, tier router, TOTP anti-replay."""
+"""Unit tests — risk engine, tier router, counter-based OTP anti-replay."""
 
-import time
+import base64
 
 import pytest
 
-from biocrypt.engine import totp
+from biocrypt.engine import otp
 from biocrypt.engine.risk_engine import (compute_risk,
                                          proximity_risk_from_rssi)
 from biocrypt.engine.tiers import (OTP_HIGH_DIGITS, OTP_HIGH_TIMEOUT_S,
@@ -125,50 +125,58 @@ class TestPerfectMatch:
 
 
 # ---------------------------------------------------------------------------
-# TOTP
+# Counter-based OTP
 # ---------------------------------------------------------------------------
-class TestTOTP:
+class TestOTP:
     def test_code_shape(self):
-        secret = totp.generate_secret()
-        assert len(totp.current_totp(secret, 6)) == 6
-        assert len(totp.current_totp(secret, 8)) == 8
-        assert totp.current_totp(secret, 6).isdigit()
+        secret = otp.generate_secret()
+        assert len(otp.current_otp(secret, 1, 4)) == 4
+        assert len(otp.current_otp(secret, 1, 6)) == 6
+        assert len(otp.current_otp(secret, 1, 8)) == 8
+        assert otp.current_otp(secret, 1, 6).isdigit()
 
-    def test_rfc6238_vector(self):
-        # RFC 6238 test vector: secret "12345678901234567890",
-        # T=59s, SHA1, 8 digits -> "94287082"
-        import base64
+    def test_rfc4226_vectors(self):
+        # RFC 4226 Appendix D: secret = ASCII "12345678901234567890".
         secret = base64.b32encode(b"12345678901234567890").decode()
-        assert totp.totp_at(secret, 8, 59) == "94287082"
+        assert otp.hotp_at(secret, 0, 6) == "755224"
+        assert otp.hotp_at(secret, 1, 6) == "287082"
+        assert otp.hotp_at(secret, 9, 6) == "520489"
 
-    def test_valid_window(self):
-        secret = totp.generate_secret()
-        code = totp.totp_at(secret, 6, time.time())
-        ok, why = totp.verify_totp(secret, 6, code, now=time.time(),
-                                   used_codes=set())
+    def test_no_clock_involvement(self):
+        # Same counter -> identical code forever; no time-based API exists.
+        secret = otp.generate_secret()
+        assert (otp.current_otp(secret, 42, 6)
+                == otp.current_otp(secret, 42, 6))
+        assert not hasattr(otp, "seconds_remaining")
+        assert not hasattr(otp, "TIMESTEP_SECONDS")
+
+    def test_unique_code_per_counter(self):
+        # Every (re)issue advances the counter -> guaranteed different code.
+        secret = otp.generate_secret()
+        codes = {otp.hotp_at(secret, c, 6) for c in range(1, 6)}
+        assert len(codes) == 5
+
+    def test_next_counter(self):
+        assert otp.next_counter(0) == 1
+        assert otp.next_counter(41) == 42
+
+    def test_verify_ok(self):
+        secret = otp.generate_secret()
+        code = otp.current_otp(secret, 7, 6)
+        ok, why = otp.verify_otp(secret, 7, 6, code)
         assert ok and why == "ok"
 
-    def test_replay_rejected(self):
-        secret = totp.generate_secret()
-        code = totp.current_totp(secret, 6)
-        used: set[str] = set()
-        ok1, _ = totp.verify_totp(secret, 6, code, used_codes=used)
-        ok2, why = totp.verify_totp(secret, 6, code, used_codes=used)
-        assert ok1 and not ok2 and why == "replay"
+    def test_verify_foreign_counter_rejected(self):
+        secret = otp.generate_secret()
+        code = otp.current_otp(secret, 8, 6)
+        ok, why = otp.verify_otp(secret, 7, 6, code)
+        assert not ok and why == "invalid"
 
-    def test_malformed_and_wrong(self):
-        secret = totp.generate_secret()
-        ok, why = totp.verify_totp(secret, 6, "12ab", used_codes=set())
+    def test_verify_malformed(self):
+        secret = otp.generate_secret()
+        ok, why = otp.verify_otp(secret, 7, 6, "12ab")
         assert not ok and why == "malformed"
-        ok, why = totp.verify_totp(secret, 6, "000000", now=time.time() + 9999,
-                                   used_codes=set())
-        assert not ok
-
-    def test_neighbour_window_accepted(self):
-        secret = totp.generate_secret()
-        step = totp.TIMESTEP_SECONDS
-        now = 1_700_000_000
-        code_prev = totp.totp_at(secret, 6, now - step)
-        ok, why = totp.verify_totp(secret, 6, code_prev, now=now,
-                                   used_codes=set())
-        assert ok and why == "ok"
+        ok, why = otp.verify_otp(secret, 7, 6, "12345")
+        assert not ok and why == "malformed"
+        ok, why = otp.verify_otp(secret, 7, 6, "")
+        assert not ok and why == "malformed"

@@ -13,7 +13,6 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-import time
 
 # Allow `python biocrypt/main.py` from the project root: make the parent
 # directory (which contains the `biocrypt` package) importable.
@@ -24,10 +23,10 @@ if _PROJECT_ROOT not in sys.path:
 
 def _selftest() -> int:
     """Headless end-to-end check of the three demo scenarios plus the
-    crypto vault, TOTP anti-replay, and audit hash chain."""
+    crypto vault, counter-OTP anti-replay, and audit hash chain."""
     from biocrypt.audit.logger import AuditLogger, AuditRecord
     from biocrypt.crypto import vault
-    from biocrypt.engine import totp
+    from biocrypt.engine import otp
     from biocrypt.engine.risk_engine import compute_risk
     from biocrypt.engine.tiers import (TIER_HIGH, TIER_LOW, TIER_MED,
                                        OTP_HIGH_DIGITS, OTP_HIGH_TIMEOUT_S,
@@ -106,21 +105,21 @@ def _selftest() -> int:
     check("exhaustion hard-locks on every tier",
           all(route_tier(s).hard_lock_on_exhaust for s in (20, 50, 90)))
 
-    # ---- TOTP + anti-replay --------------------------------------------
-    secret = totp.generate_secret()
-    code = totp.current_totp(secret, 6)
-    ok, why = totp.verify_totp(secret, 6, code, used_codes=set())
-    check("TOTP: fresh code accepted", ok and why == "ok")
-    ok2, why2 = totp.verify_totp(secret, 6, code,
-                                 used_codes={code})
-    check("TOTP: reuse rejected as replay",
-          not ok2 and why2 == "replay")
-    ok3, why3 = totp.verify_totp(secret, 6, "000000" if code != "000000"
-                                 else "000001", used_codes=set(),
-                                 now=time.time() + 10_000)
-    check("TOTP: wrong/expired code rejected", not ok3)
-    code8 = totp.current_totp(secret, 8)
-    check("TOTP: 8-digit mode produces 8 digits", len(code8) == 8)
+    # ---- Counter-based OTP + anti-replay --------------------------------
+    secret = otp.generate_secret()
+    counter = otp.next_counter(0)
+    code = otp.current_otp(secret, counter, 6)
+    ok, why = otp.verify_otp(secret, counter, 6, code)
+    check("OTP: active challenge code accepted", ok and why == "ok")
+    next_code = otp.current_otp(secret, otp.next_counter(counter), 6)
+    check("OTP: each (re)issue yields a different code", next_code != code)
+    ok3, why3 = otp.verify_otp(secret, counter, 6, next_code)
+    check("OTP: code from another challenge rejected",
+          not ok3 and why3 == "invalid")
+    ok4, why4 = otp.verify_otp(secret, counter, 6, "12ab")
+    check("OTP: malformed code rejected", not ok4 and why4 == "malformed")
+    code8 = otp.current_otp(secret, 7, 8)
+    check("OTP: 8-digit mode produces 8 digits", len(code8) == 8)
 
     # ---- AES-256-GCM vault round-trip -----------------------------------
     with tempfile.TemporaryDirectory() as tmp:

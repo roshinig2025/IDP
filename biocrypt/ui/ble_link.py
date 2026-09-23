@@ -2,11 +2,16 @@
 
 Models the wireless link between the trusted device (e.g. the user's phone,
 whose proximity is measured via BLE RSSI) and the lock. Two properties are
-simulated so the panel can *see* why RSSI is a risk signal:
+simulated on FIRST delivery so the panel can *see* why RSSI is a risk
+signal:
 
   * Latency scales with distance (weaker RSSI -> slower delivery).
   * Reliability scales with distance: at weak signal the packet may be
     garbled (a character is corrupted) and need a re-sync request.
+
+A re-sync (resync=True) models a clean retransmission on an established
+connection: it arrives almost instantly (well under 2 s) and is never
+garbled.
 
 Everything runs in-process (threads only), so the demo needs no radios.
 """
@@ -58,7 +63,8 @@ class BlePacket:
     delivered_at: float | None = None
     delivered_code: str | None = None
     garbled: bool = False
-    status: str = "in-flight"   # in-flight -> delivered | garbled
+    resync: bool = False
+    status: str = "in-flight"   # in-flight -> delivered | garbled | resynced
 
 
 class BleLink:
@@ -79,19 +85,29 @@ class BleLink:
 
     # -- transmission -------------------------------------------------------
 
-    def send_otp(self, otp: str, rssi_dbm: float) -> BlePacket:
-        """Queue the OTP for delivery; latency/garbling depend on RSSI."""
-        band = _band(rssi_dbm)
-        prob = {"strong": 0.0,
-                "moderate": GARBLE_PROB_MODERATE,
-                "weak": GARBLE_PROB_WEAK}[band]
-        lo, hi = _LATENCY_BY_BAND[band]
-        delay = random.uniform(lo, hi)
+    def send_otp(self, otp: str, rssi_dbm: float,
+                 resync: bool = False) -> BlePacket:
+        """Queue the OTP for delivery.
 
-        packet = BlePacket(otp=otp, rssi_dbm=float(rssi_dbm))
-        delivered_code = _garble(otp, prob)
-        packet.garbled = delivered_code != otp
-        packet.status = "garbled" if packet.garbled else "delivered"
+        First delivery: latency/garbling depend on RSSI (the proximity
+        demo). Re-sync (resync=True): near-instant, always clean.
+        """
+        packet = BlePacket(otp=otp, rssi_dbm=float(rssi_dbm), resync=resync)
+        if resync:
+            delay = random.uniform(0.3, 0.8)   # always < 2 s
+            delivered_code = otp               # retransmission is clean
+            packet.garbled = False
+            packet.status = "resynced"
+        else:
+            band = _band(rssi_dbm)
+            prob = {"strong": 0.0,
+                    "moderate": GARBLE_PROB_MODERATE,
+                    "weak": GARBLE_PROB_WEAK}[band]
+            lo, hi = _LATENCY_BY_BAND[band]
+            delay = random.uniform(lo, hi)
+            delivered_code = _garble(otp, prob)
+            packet.garbled = delivered_code != otp
+            packet.status = "garbled" if packet.garbled else "delivered"
 
         with self._lock:
             self._packets.append(packet)
@@ -114,16 +130,6 @@ class BleLink:
                 cb(packet)
             except Exception:
                 pass
-
-    def request_resync(self) -> None:
-        """Re-transmit the most recent OTP (used after a garbled delivery)."""
-        with self._lock:
-            if not self._packets:
-                return
-            last = self._packets[-1]
-            rssi = self._last_rssi
-        clean = last.otp
-        self.send_otp(clean, rssi)
 
     def snapshot(self) -> list[dict]:
         with self._lock:

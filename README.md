@@ -2,7 +2,7 @@
 
 Review II working prototype (~20% initial implementation): a desktop app that
 demonstrates the project's core IP without hardware — the **context-fusion
-risk engine**, **3-tier risk-adaptive authentication** with dynamic TOTP
+risk engine**, **3-tier risk-adaptive authentication** with dynamic OTP
 step-up, **AES-256-GCM file/folder decryption**, and an **anti-replay,
 tamper-evident audit logger**.
 
@@ -20,7 +20,7 @@ From the project root (the folder containing `biocrypt/`):
 ```bash
 python biocrypt/main.py             # full GUI demo (Lock console + Trusted Device window)
 python biocrypt/main.py --selftest  # headless end-to-end verification
-python -m pytest tests/ -q          # 37 unit tests
+python -m pytest tests/ -q          # 43 unit tests
 python tests/gui_smoke.py           # scripted end-to-end GUI test (headless-friendly)
 ```
 
@@ -33,8 +33,12 @@ python tests/gui_smoke.py           # scripted end-to-end GUI test (headless-fri
    *Fingerprint optical match score (0–100 %)* and *BLE RSSI (−90…−30 dBm)*;
    spin *Attempt history* or hit *Inject failed attempt*. Or press one of the
    three one-click scenarios.
-3. **Module 2 — Risk engine (right panel):** press **RUN ACCESS ATTEMPT**.
-   The dynamic risk score (0–100) and its component breakdown appear live:
+3. **Module 2 — Risk engine (right panel):** the dynamic risk score (0–100)
+   and its component breakdown update **live as you drag the sliders** —
+   the gauge, tier, and predicted routing are a real-time *preview* and
+   nothing is logged. Press **RUN ACCESS ATTEMPT** to evaluate for real;
+   the tag switches from `LIVE PREVIEW` to `EVALUATED` and the attempt
+   enters the audit trail:
 
    ```
    risk = 0.50·(100 − fingerprint%)      ← biometric confidence
@@ -81,7 +85,7 @@ python tests/gui_smoke.py           # scripted end-to-end GUI test (headless-fri
 **Anti-replay demo:** unlock with a Medium-tier code, then immediately
 re-submit the *same* code and verify — the console flags it as a replay
 attempt in the result line and the audit trail (try it: it works even
-though the 30 s TOTP window is still open).
+though a fresh challenge code is guaranteed different on every re-issue).
 
 ## Architecture
 
@@ -98,12 +102,12 @@ Fingerprint %   BLE RSSI   Attempt history
         ┌─────────────────────────┐        │  TIERED ROUTER           │  biocrypt/engine/tiers.py
         │  perfect / Low / Med/Hi  │
         └───────┬─────────┬───────┘
-     no OTP     │         │  4/6/8-digit TOTP over simulated BLE
+     no OTP     │         │  4/6/8-digit OTP over simulated BLE
                 ▼         ▼  (biocrypt/ui/ble_link.py → Trusted Device)
         ┌───────────┐ ┌──────────────────┐
-        │ 1-TOUCH   │ │ TOTP STEP-UP     │ biocrypt/engine/totp.py (RFC 6238,
-        │ UNLOCK    │ │ tries+timeout,   │ single-use per session,
-        │           │ │ HARD LOCK        │ anti-replay)
+        │ 1-TOUCH   │ │ OTP STEP-UP      │ biocrypt/engine/otp.py (RFC 4226,
+        │ UNLOCK    │ │ tries+timeout,   │ counter-based — re-issued only on
+        │           │ │ HARD LOCK        │ resync / wrong try / timeout)
         └─────┬─────┘ └────────┬─────────┘
               ▼                ▼
         ┌─────────────────────────────┐   ┌──────────────────────────┐
@@ -119,8 +123,8 @@ Fingerprint %   BLE RSSI   Attempt history
 |---|---|
 | Requirement analysis — why static MFA fails | Risk engine fusion vs fixed OTP: same user, different context → different challenge (run the 3 scenarios) |
 | System design & architecture | Diagram above + modular package split (`engine` / `crypto` / `audit` / `ui`) |
-| Component selection & justification | AES-256-GCM (authenticated encryption), RFC 6238 TOTP, PBKDF2-HMAC-SHA256 (600k iters), SQLite hash chain, RSSI bands |
-| **Initial prototype (~20%)** | Live GUI: sliders → risk score → tier routing → dynamic OTP → file unlock → audit trail |
+| Component selection & justification | AES-256-GCM (authenticated encryption), RFC 4226 counter-based HOTP, PBKDF2-HMAC-SHA256 (600k iters), SQLite hash chain, RSSI bands |
+| **Initial prototype (~20%)** | Live GUI: sliders → **live risk preview** → tier routing → dynamic OTP → file unlock → audit trail |
 | Innovation & feasibility | OTP length *and* retry budget scale with multi-factor risk (4/6/8 digits, 3/3/1 tries); perfect-signal instant unlock; proximity-dependent OTP delivery; non-invertible biometric weighting (only the match *score* is consumed — templates never stored) |
 | Q&A defence | Hardware phase next: ESP32 + optical fingerprint module + BLE RSSI feed the same engine via the Module-1 simulator interface |
 
@@ -133,9 +137,9 @@ Fingerprint %   BLE RSSI   Attempt history
 - Original file path is GCM AAD → ciphertexts cannot be swapped between
   files; any tampering fails the GCM tag and aborts the restore.
 - OTPs are single-use **per challenge session**: a consumed code can never
-  satisfy another verification; re-submission — even within the same 30 s
-  window — is rejected as **replay** and flagged in the hash-chained audit
-  ledger (editing any historical row breaks the chain). Exhausting tries
+  satisfy another verification; a re-submission of any consumed code —
+  even right after a successful unlock — is rejected as **replay** and
+  flagged in the hash-chained audit ledger (editing any historical row breaks the chain). Exhausting tries
   hard-locks the console until an explicit, audit-logged reset.
 
 ## Layout
@@ -143,12 +147,12 @@ Fingerprint %   BLE RSSI   Attempt history
 ```
 biocrypt/
 ├── main.py                  entrypoint (--selftest for headless demo)
-├── engine/                  risk_engine.py · tiers.py · totp.py
+├── engine/                  risk_engine.py · tiers.py · otp.py
 ├── crypto/vault.py          AES-256-GCM seal/unseal
 ├── audit/logger.py          hash-chained SQLite logger
 └── ui/                      app.py · device_window.py · ble_link.py
 tests/
-├── test_engine.py           risk math, tier edges, TOTP vectors & replay
+├── test_engine.py           risk math, tier edges, HOTP vectors & replay
 ├── test_vault_audit.py      vault round-trip, tamper, chain integrity
 └── gui_smoke.py             scripted end-to-end GUI run
 ```

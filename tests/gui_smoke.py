@@ -4,9 +4,12 @@ demo flow with a scripted BLE link (no randomness) and a fresh audit DB.
 Covers:
   [1] perfect match (fp=100, RSSI >= -50)  -> instant unlock, NO OTP
   [2] perfect match STILL unlocks with failed attempts on record
+  [2b] live preview: slider changes recompute score/tier WITHOUT running
   [3] Low tier: 4-digit OTP, wrong x3 -> HARD LOCK (no auto recovery)
   [4] Reset lock button recovers
-  [5] Medium tier: 6-digit OTP, wrong x2 + correct on 3rd try -> unlock
+  [5] Medium tier: 6-digit OTP, wrong x2 (fresh code each time) + correct
+  [5b] Re-sync BLE: instant clean re-delivery of the SAME code; no-op
+       when no challenge is active
   [6] replay of a used code is rejected AND consumes a try
   [7] High tier: 8-digit OTP, single try -> wrong entry -> HARD LOCK
   [8] vault auto-decrypts after a successful auth
@@ -45,11 +48,13 @@ class ScriptedBleLink:
     def subscribe(self, cb):
         self.subscribers.append(cb)
 
-    def send_otp(self, otp: str, rssi_dbm: float) -> BlePacket:
+    def send_otp(self, otp: str, rssi_dbm: float,
+                 resync: bool = False) -> BlePacket:
         self.sent.append((otp, rssi_dbm))
         packet = BlePacket(otp=otp, rssi_dbm=rssi_dbm, garbled=False,
-                           status="delivered", delivered_at=time.time(),
-                           delivered_code=otp)
+                           resync=resync,
+                           status="resynced" if resync else "delivered",
+                           delivered_at=time.time(), delivered_code=otp)
         for cb in self.subscribers:
             cb(packet)
         return packet
@@ -105,26 +110,68 @@ def main() -> int:
     check("still no OTP issued", len(app.link.sent) == 0)
     check("still Unlocked", "Unlocked" in app.result_lbl.cget("text"))
 
+    # -- 2b. Live preview: sliders recompute the score without RUN -----------
+    print("\\n[2b] Live preview (sliders only, no RUN)")
+
+    def gauge_texts() -> list[str]:
+        return [app.gauge.itemcget(item, "text")
+                for item in app.gauge.find_withtag("all")
+                if app.gauge.type(item) == "text"]
+
+    app.fp_var.set(13.0)                    # risk 68.0 -> Medium
+    app.rssi_var.set(-82.0)
+    app.fails_var.set(0)
+    app._update_preview()
+    pump(root, 100)
+    check("preview shows Medium at fp=13 / rssi=-82",
+          "PREVIEW: Medium" in app.tier_lbl.cget("text"))
+    check("preview gauge shows 68.00", "68.00 / 100" in gauge_texts())
+    check("preview tag says press RUN",
+          "press RUN" in app.preview_lbl.cget("text"))
+
+    app.fp_var.set(15.0)                    # BLE stable, fp down: 71.5 High
+    app.fails_var.set(3)
+    app._update_preview()
+    pump(root, 100)
+    check("moving fp alone raises preview to High",
+          "PREVIEW: High" in app.tier_lbl.cget("text"))
+
+    app.fp_var.set(50.0)                    # strong BLE, fp=50: 25.0 Low
+    app.rssi_var.set(-45.0)
+    app.fails_var.set(0)
+    app._update_preview()
+    pump(root, 100)
+    check("preview drops to Low with strong BLE",
+          "PREVIEW: Low" in app.tier_lbl.cget("text"))
+
+    app.fp_var.set(13.0)                    # RUN now evaluates and logs
+    app.rssi_var.set(-82.0)
+    sent_before = len(app.link.sent)
+    app.run_access_attempt()
+    pump(root, 200)
+    check("RUN at fp=13 issues 6-digit OTP (evaluated Medium)",
+          len(app.link.sent) == sent_before + 1
+          and len(app.link.sent[-1][0]) == 6)
+    check("panel switched to EVALUATED",
+          "EVALUATED" in app.preview_lbl.cget("text"))
+
     # -- 3. Low tier: 4-digit OTP, wrong x3 -> hard lock ---------------------
     print("\\n[3] Low tier: 3 wrong tries -> HARD LOCK")
     app.fp_var.set(80.0)                    # risk 10.0 -> Low, not perfect
     app.rssi_var.set(-55.0)
     app.fails_var.set(0)
+    base = len(app.link.sent)               # stage [2b] already sent one packet
     app.run_access_attempt()
     pump(root, 300)
-    check("one 4-digit OTP sent", len(app.link.sent) == 1
-          and len(app.link.sent[0][0]) == 4)
+    check("one 4-digit OTP sent", len(app.link.sent) == base + 1
+          and len(app.link.sent[base][0]) == 4)
     check("tries counter initialised to 3", app.tries_left == 3)
 
-    app.otp_var.set("0000" if app.link.sent[0][0] != "0000" else "0001")
-    app.verify_otp()
-    pump(root, 150)
-    app.otp_var.set("0000" if app.link.sent[1][0] != "0000" else "0001")
-    app.verify_otp()
-    pump(root, 150)
-    app.otp_var.set("0000" if app.link.sent[2][0] != "0000" else "0001")
-    app.verify_otp()                        # 3rd wrong -> exhausted
-    pump(root, 150)
+    for offset in range(3):
+        code = app.link.sent[base + offset][0]   # fresh code per try
+        app.otp_var.set("0000" if code != "0000" else "0001")
+        app.verify_otp()
+        pump(root, 150)                     # 3rd wrong -> exhausted
     check("hard lock engaged", app.hard_locked is True)
     check("RUN disabled", str(app.run_btn.cget("state")) == "disabled")
     check("OTP entry disabled",
@@ -152,14 +199,18 @@ def main() -> int:
     med1 = app.link.sent[-1][0]
 
     app.otp_var.set("000000" if med1 != "000000" else "000001")
-    app.verify_otp()
+    app.verify_otp()                        # wrong try 1
     pump(root, 150)
-    app.otp_var.set("000000" if med1 != "000000" else "000001")
-    app.verify_otp()
+    med2 = app.link.sent[-1][0]
+    check("fresh OTP re-issued after failure 1 (differs from prior code)",
+          len(app.link.sent) >= 2 and med2 != med1 and len(med2) == 6)
+
+    app.otp_var.set("000000" if med2 != "000000" else "000001")
+    app.verify_otp()                        # wrong try 2
     pump(root, 150)
-    check("fresh OTP re-issued after each failure",
-          len(app.link.sent) >= 4)
     med3 = app.link.sent[-1][0]
+    check("fresh OTP re-issued after failure 2 (differs again)",
+          med3 not in (med1, med2) and len(med3) == 6)
     check("on final try before verify", app.tries_left == 1)
     check("app expects the latest issued code",
           app.active_otp is not None and app.active_otp[0] == med3)
@@ -169,6 +220,32 @@ def main() -> int:
     pump(root, 150)
     check("correct OTP unlocks on final try",
           "Unlocked" in app.result_lbl.cget("text"))
+
+    # -- 5b. Re-sync BLE: same code, clean + instant; no-op w/o challenge ----
+    print("\\n[5b] Re-sync BLE")
+    app.fp_var.set(65.0)                    # fresh Med challenge
+    app.rssi_var.set(-68.0)
+    app.fails_var.set(2)
+    app.run_access_attempt()
+    pump(root, 300)
+    active = app.link.sent[-1][0]
+    base = len(app.link.sent)
+    app.resync_ble()
+    pump(root, 300)
+    check("resync redelivers the SAME code (value unchanged)",
+          len(app.link.sent) == base + 1 and app.link.sent[-1][0] == active)
+    check("resync consumed no try", app.tries_left == 3)
+    check("resync keeps the challenge active",
+          app.active_otp is not None and app.active_otp[0] == active)
+
+    app.otp_var.set(active)                 # unlock closes the session
+    app.verify_otp()
+    pump(root, 150)
+    check("challenge closed after success", app.active_otp is None)
+    app.resync_ble()
+    pump(root, 100)
+    check("resync with no active challenge is a no-op",
+          "No active challenge" in app.result_lbl.cget("text"))
 
     # -- 6. Replay: re-submitting the consumed code is rejected ----------------
     print("\\n[6] Anti-replay check")

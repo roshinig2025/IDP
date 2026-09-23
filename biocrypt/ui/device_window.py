@@ -1,9 +1,10 @@
 """Trusted Device window — Bio-Crypt Lock.
 
 Simulates the user's phone (the device whose BLE proximity is measured).
-When the risk engine issues a TOTP challenge, the code "arrives" here over
+When the risk engine issues an OTP challenge, the code "arrives" here over
 the simulated BLE channel after a distance-dependent delay — visibly
-demonstrating why proximity is part of the risk score.
+demonstrating why proximity is part of the risk score. A Re-sync BLE
+request re-delivers the SAME code almost instantly and never garbled.
 
 The user then re-types the code in the LOCK window, modelling the flow:
     risk engine -> OTP over BLE -> trusted device -> human re-entry -> lock
@@ -83,13 +84,21 @@ class TrustedDeviceWindow:
                 fg="#ff5c7a")
             self.meta_lbl.config(
                 text="Tap RE-SYNC on the lock to request re-transmission.")
+        elif packet.status == "resynced":
+            self.otp_lbl.config(text=packet.otp, fg=PHONE_BG,
+                                bg=PHONE_ACCENT)
+            self.status_lbl.config(
+                text="\u21BB  Re-synced — clean retransmission (same code)",
+                fg=PHONE_ACCENT)
+            self.meta_lbl.config(
+                text="Enter this code in the LOCK window.")
         else:
             self.otp_lbl.config(text=packet.otp, fg=PHONE_BG,
                                 bg=PHONE_ACCENT)
             self.status_lbl.config(
                 text="\u2713  OTP received via BLE", fg=PHONE_ACCENT)
             self.meta_lbl.config(
-                text="Enter this code in the LOCK window within 30 s.")
+                text="Enter this code in the LOCK window.")
 
         self._append_history(packet)
 
@@ -97,7 +106,8 @@ class TrustedDeviceWindow:
         import time as _time
         self.history.configure(state="normal")
         stamp = _time.strftime("%H:%M:%S")
-        tag = "GARBLED" if packet.status == "garbled" else "OK"
+        tag = ("GARBLED" if packet.status == "garbled"
+               else "RESYNC" if packet.status == "resynced" else "OK")
         self.history.insert("1.0", f"[{stamp}] OTP {tag}  rssi="
                             f"{packet.rssi_dbm if hasattr(packet, 'rssi_dbm') else '?'}\n")
         self.history.configure(state="disabled")

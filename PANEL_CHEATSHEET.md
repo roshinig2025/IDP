@@ -43,7 +43,7 @@ Close: "Fixed MFA gives everyone the same challenge. Ours scales OTP length, tri
 ## 3. Flow of events — Input → Architecture → Output
 
 ```
-INPUTS (Module 1 — sliders simulate hardware)
+INPUTS (Module 1 — sliders simulate hardware) · panel updates LIVE as sliders move
   fp_match_score : 0–100 %      (fingerprint optical match)
   rssi_dbm       : −90…−30 dBm  (BLE proximity; closer to 0 = nearer)
   failed_attempts: 0…5          (recent failure history)
@@ -61,10 +61,13 @@ ARCHITECTURE
       Med 31–70→ 6-digit OTP · 3 tries · 90 s/try
       High ≥71 → 8-digit OTP · 1 try · 60 s
   [3] OTP CHANNEL                        ble_link.py → device_window.py
-      RFC 6238 TOTP over simulated BLE; latency & garbling scale with RSSI
-  [4] VERIFIER                           totp.py
-      30 s window ±1 · constant-time compare · single-use per session
-      → replay rejection
+      Counter-based OTP (RFC 4226) over simulated BLE; first delivery
+      latency & garbling scale with RSSI — RE-SYNC BLE re-sends the SAME
+      code in < 2 s, always clean (only a retransmission, never a new code)
+  [4] VERIFIER                           otp.py
+      constant-time compare vs the active challenge code · single-use
+      per session → replay rejection · codes change ONLY on resync /
+      wrong attempt / timeout — never on a clock
   [5] VAULT (on success)                 vault.py
       AES-256-GCM · PBKDF2-600k · path-as-AAD → folder auto-decrypts
   [6] AUDIT LOGGER (every event)         logger.py
@@ -73,6 +76,8 @@ ARCHITECTURE
         ▼
 OUTPUTS
   • Risk score + component breakdown (on gauge)
+  • LIVE PREVIEW vs EVALUATED: slider moves recompute the score/tier in
+    real time (display-only, NOT logged); RUN evaluates and audit-logs
   • Tier decision + challenge issued to Trusted Device
   • Unlock / denied / hard-lock verdict
   • Tamper-evident audit row for EVERY event (incl. resets)
@@ -93,7 +98,7 @@ OUTPUTS
 | Med challenge | 6 digits · 3 tries · 90 s per try |
 | High challenge | 8 digits · 1 try · 60 s |
 | Exhaustion | Hard lock on EVERY tier; Reset lock (logged) or restart |
-| TOTP | RFC 6238, SHA-1, 30 s steps, ±1 window, single-use per session |
+| OTP | RFC 4226 counter-based (HOTP), SHA-1, no clock — new code only on resync / wrong attempt / timeout; single-use per session |
 | Vault | AES-256-GCM, PBKDF2-HMAC-SHA256 ×600 000, 12-byte nonces, path as AAD |
 | Audit | SQLite + SHA-256 hash chain, genesis 000…0, CSV export |
 | Demo passphrase | `biocrypt-demo` |
